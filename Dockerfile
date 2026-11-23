@@ -28,7 +28,9 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 COPY public ./public
 COPY scripts ./scripts
-RUN npm ci && npm cache clean --force
+# NODE_ENV=production makes npm skip devDependencies by default; the build
+# needs TypeScript/Vite/esbuild, so force their installation here and prune later.
+RUN npm ci --include=dev && npm cache clean --force
 
 COPY tsconfig.json tsconfig.server.json vite.config.ts index.html ./
 COPY shared ./shared
