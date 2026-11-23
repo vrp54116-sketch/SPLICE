@@ -52,6 +52,16 @@ async function sha256(buf: ArrayBuffer | Uint8Array) {
   return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
+/** Spreading 8 MB into String.fromCharCode blows the JS argument limit; build it in slices. */
+function toBase64(bytes: Uint8Array): string {
+  let binary = '';
+  const STEP = 0x8000;
+  for (let i = 0; i < bytes.length; i += STEP) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + STEP));
+  }
+  return btoa(binary);
+}
+
 interface UploadState { status: 'idle' | 'uploading' | 'paused' | 'done' | 'error'; sent: number; total: number; error?: string; id?: string }
 const CHUNK = 8 * 1024 * 1024;
 
@@ -86,7 +96,8 @@ function SourcePanel({ source, onChange }: { source: Source; onChange: (s: Sourc
       for (let i = fromIndex; i < Math.ceil(file.size / CHUNK); i++) {
         while (paused.current) await new Promise((r) => setTimeout(r, 150));
         const chunk = file.slice(i * CHUNK, Math.min(file.size, (i + 1) * CHUNK));
-        const p = await api<{ received: number }>('/api/upload/chunk', { id: uploadId!, index: i, hash: await sha256(await chunk.arrayBuffer()), chunk: btoa(String.fromCharCode(...new Uint8Array(await chunk.arrayBuffer()))) });
+        const bytes = new Uint8Array(await chunk.arrayBuffer());
+        const p = await api<{ received: number }>('/api/upload/chunk', { id: uploadId!, index: i, hash: await sha256(bytes), chunk: toBase64(bytes) });
         setUpload((u) => ({ ...u, sent: p.received }));
       }
       const done = await api<{ ref: string; duration: number }>('/api/upload/complete', { id: uploadId! });

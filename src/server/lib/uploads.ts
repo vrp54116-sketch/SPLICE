@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { config } from '../config';
 import { fail } from '../errors';
 import { safeName, sha256, uid, touch } from './util';
@@ -50,8 +51,18 @@ export async function completeUpload(id: string): Promise<{ ref: string; path: s
     if (!out.write(buf)) await new Promise<void>((r) => out.once('drain', () => r()));
   }
   await new Promise<void>((resolve, reject) => { out.end(() => resolve()); out.on('error', reject); });
-  const digest = sha256(await fsp.readFile(final));
+  // Stream the file so a large upload never has to fit in the container's memory.
+  const hash = createHash('sha256');
+  await new Promise<void>((resolve, reject) => {
+    const input = fs.createReadStream(final);
+    input.on('data', (chunk) => hash.update(chunk));
+    input.on('end', () => resolve());
+    input.on('error', reject);
+  });
+  const digest = hash.digest('hex');
   if (digest !== u.hash) fail('VALIDATION', 'Whole-file checksum mismatch. Re-upload the file.');
+  // Chunks are no longer needed — free the disk space before processing starts.
+  await fsp.rm(path.join(dir(), id), { recursive: true, force: true });
   u.final = final;
   return { ref: id, path: final, name: u.name };
 }
