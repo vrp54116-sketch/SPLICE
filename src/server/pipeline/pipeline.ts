@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import type {
-  ClipRecord, Moment, OffloadResult, ProjectConfig, RepairAction, ShieldReport, Span, Transcript, ShieldTier,
+  ApiKeys, ClipRecord, Moment, OffloadResult, ProjectConfig, RepairAction, ShieldReport, Span, Transcript, ShieldTier,
 } from '@shared/types';
 import { config } from '../config';
 import { fail } from '../errors';
@@ -33,7 +33,7 @@ const OFFLOAD_FALLBACK = (frames: Awaited<ReturnType<typeof sampleFrames>>): Off
   engine: 'fallback', faceEngine: 'frame-diff saliency (server)', ocrEngine: 'unavailable — no browser offload',
 });
 
-export async function runPipeline(job: Job, cfg: ProjectConfig, mediaPath: string, media: MediaInfo, sourceMeta: SourceMeta): Promise<ClipRecord[]> {
+export async function runPipeline(job: Job, cfg: ProjectConfig, mediaPath: string, media: MediaInfo, sourceMeta: SourceMeta, keys?: ApiKeys): Promise<ClipRecord[]> {
   const dir = path.join(config.scratch, 'jobs', job.id);
   await fsp.mkdir(dir, { recursive: true });
   const signal = job.controller.signal;
@@ -51,7 +51,7 @@ export async function runPipeline(job: Job, cfg: ProjectConfig, mediaPath: strin
   await extractAudio(mediaPath, fullPcm, 0, Math.min(media.duration, 7200));
   let transcript: Transcript = { words: [], text: '', mode: 'none' };
   try {
-    if (asrMode() !== 'local-basic' || localAsrAvailable()) transcript = await transcribe(fullPcm, cfg.language, signal);
+    if (asrMode(keys) !== 'local-basic' || localAsrAvailable()) transcript = await transcribe(fullPcm, cfg.language, signal, keys);
     else progress(job.id, { message: 'Local basic transcription unavailable — scoring from audio, shots and offload only.' });
   } catch (e) {
     progress(job.id, { message: 'Transcription engine unavailable — continuing with audio-only scoring and no invented captions.' });
@@ -69,7 +69,7 @@ export async function runPipeline(job: Job, cfg: ProjectConfig, mediaPath: strin
   const window = { start: cfg.timeframe.start, end: Math.min(cfg.timeframe.end, media.duration) };
   const target = targetSeconds(cfg);
   const coarse = coarseSpans(window, target);
-  const fingerprints = await fingerprintsFor(fullPcm, window);
+  const fingerprints = await fingerprintsFor(fullPcm, window, keys);
   const baseRightsInput = (span: Span, clipId: string, version: number, pass: number, applied: RepairAction[] = [], off = offload, fr = frames): RightsInput => ({
     span, duration: media.duration, frames: fr, offload: off, transcript,
     metadata: { title: sourceMeta.title, description: sourceMeta.description, license: sourceMeta.license, filename: cfg.source.filename || cfg.source.url },
@@ -85,7 +85,7 @@ export async function runPipeline(job: Job, cfg: ProjectConfig, mediaPath: strin
   const llm = await suggestMoments({
     transcript, shots, duration: media.duration, count: cfg.clipCount,
     targetSeconds: target, clipType: cfg.clipType, language: cfg.language,
-  });
+  }, keys);
   const moments = findMoments({
     transcript, frames, shots, offload, duration: media.duration, config: cfg, targetSeconds: target, risks,
   }, llm.moments);
@@ -180,14 +180,14 @@ function coarseSpans(window: Span, target: number): Span[] {
   return out.slice(0, 40);
 }
 
-async function fingerprintsFor(pcm: string, window: Span) {
+async function fingerprintsFor(pcm: string, window: Span, keys?: ApiKeys) {
   const head = path.join(path.dirname(pcm), 'head.pcm'), tail = path.join(path.dirname(pcm), 'tail.pcm');
   slicePcm(pcm, head, window.start, Math.min(window.start + 5, window.start + 60));
   slicePcm(pcm, tail, Math.max(window.start, window.end - 5), window.end);
   return {
-    full: await fingerprint(pcm, window),
-    head: await fingerprint(head, { start: window.start, end: window.start + 5 }),
-    tail: await fingerprint(tail, { start: window.end - 5, end: window.end }),
+    full: await fingerprint(pcm, window, keys),
+    head: await fingerprint(head, { start: window.start, end: window.start + 5 }, keys),
+    tail: await fingerprint(tail, { start: window.end - 5, end: window.end }, keys),
   };
 }
 

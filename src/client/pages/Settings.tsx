@@ -5,13 +5,37 @@ import {
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { useApp } from '../store/useApp';
-import { api } from '../lib/api';
+import { api, ApiError } from '../lib/api';
+import { loadApiKeys, saveApiKeys } from '../lib/keys';
+import { checkKeyFailures, markFailuresSeen } from '../lib/keyAlerts';
 import { sound } from '../lib/sound';
 import { bytesUsed } from '../lib/db';
 import { Card, Eyebrow, InfoNote, Modal, Segmented, Toggle } from '../components/ui';
-import type { RightsPolicy } from '@shared/types';
+import { PROVIDER_LABELS, type ApiKeys, type KeyFailure, type ProviderId, type RightsPolicy } from '@shared/types';
 
-interface Health { status: string; llm: string; asr: string; rights: string; localAsr: boolean; ytdlpVersion: string | null; ffmpeg: string; busy: boolean; queueSize: number; uptime: number; storageLimitGb: number; maxDurationMin: number }
+interface Health { status: string; llm: string; asr: string; rights: string; localAsr: boolean; ytdlpVersion: string | null; ffmpeg: string; busy: boolean; queueSize: number; uptime: number; storageLimitGb: number; maxDurationMin: number; keyFailures?: KeyFailure[] }
+
+const KEY_ROWS: Array<{ id: ProviderId; fields: Array<{ key: keyof ApiKeys; label: string; placeholder: string; secret?: boolean }> }> = [
+  { id: 'tokenharbor', fields: [
+    { key: 'tokenHarborKey', label: 'API key', placeholder: 'sk-…', secret: true },
+    { key: 'tokenHarborBase', label: 'Base URL', placeholder: 'https://…/v1' },
+    { key: 'tokenHarborModel', label: 'Model (optional)', placeholder: 'gpt-4o-mini' },
+  ] },
+  { id: 'groq', fields: [{ key: 'groq', label: 'API key', placeholder: 'gsk_…', secret: true }] },
+  { id: 'gemini', fields: [{ key: 'gemini', label: 'API key', placeholder: 'AIza…', secret: true }] },
+  { id: 'openai-compatible', fields: [
+    { key: 'openaiCompatible', label: 'API key', placeholder: 'sk-…', secret: true },
+    { key: 'openaiBase', label: 'Base URL', placeholder: 'https://…/v1' },
+  ] },
+  { id: 'deepgram', fields: [{ key: 'deepgram', label: 'API key', placeholder: 'Deepgram token', secret: true }] },
+  { id: 'assemblyai', fields: [{ key: 'assembly', label: 'API key', placeholder: 'AssemblyAI token', secret: true }] },
+  { id: 'audd', fields: [{ key: 'audd', label: 'API key', placeholder: 'AudD token', secret: true }] },
+  { id: 'acrcloud', fields: [
+    { key: 'acrcloudKey', label: 'Access key', placeholder: 'Access key', secret: true },
+    { key: 'acrcloudSecret', label: 'Access secret', placeholder: 'Access secret', secret: true },
+    { key: 'acrcloudHost', label: 'Host (optional)', placeholder: 'identify-us-west-2.acrcloud.com' },
+  ] },
+];
 
 export function Settings() {
   const { settings, setSetting, config, setConfig, clips, projects, restoreDemos, clearLocalData, navigate, brand } = useApp();
@@ -20,10 +44,44 @@ export function Settings() {
   const [confirmClear, setConfirmClear] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
   const [importText, setImportText] = useState('');
+  const [keys, setKeys] = useState<ApiKeys>(() => loadApiKeys());
+  const [testing, setTesting] = useState<ProviderId | null>(null);
+  const [keyStatus, setKeyStatus] = useState<Partial<Record<ProviderId, 'working' | 'failed'>>>({});
   const fileRef = useRef<HTMLInputElement>(null);
 
-  const refresh = () => { void api<Health>('/api/health').then(setHealth).catch(() => setHealth(null)); void bytesUsed().then(setStorage); };
+  const refresh = () => {
+    void api<Health>('/api/health').then((h) => { setHealth(h); markFailuresSeen(h.keyFailures ?? []); }).catch(() => setHealth(null));
+    void bytesUsed().then(setStorage);
+  };
   useEffect(refresh, []);
+
+  const configured = (id: ProviderId) => KEY_ROWS.find((r) => r.id === id)!.fields.some((f) => keys[f.key].trim().length > 0);
+
+  const testKeys = async (ids: ProviderId[]) => {
+    for (const id of ids) {
+      setTesting(id);
+      try {
+        await api('/api/keys/test', { provider: id });
+        setKeyStatus((s) => ({ ...s, [id]: 'working' }));
+        if (ids.length === 1) toast.success(`${PROVIDER_LABELS[id]} key works`);
+      } catch (e) {
+        setKeyStatus((s) => ({ ...s, [id]: 'failed' }));
+        toast.error(`${PROVIDER_LABELS[id]} key is not working — replace it`, {
+          description: e instanceof ApiError ? e.error.message : e instanceof Error ? e.message : 'No response from the provider',
+        });
+      }
+    }
+    setTesting(null);
+    refresh();
+  };
+
+  useEffect(() => {
+    if (sessionStorage.getItem('splice_keys_autotested')) return;
+    sessionStorage.setItem('splice_keys_autotested', '1');
+    const ready = KEY_ROWS.map((r) => r.id).filter(configured);
+    if (ready.length) void checkKeyFailures().then(() => { void testKeys(ready); });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const exportData = () => {
     const blob = new Blob([JSON.stringify({ version: 1, exportedAt: new Date().toISOString(), clips, projects, settings, brand, config }, null, 2)], { type: 'application/json' });
@@ -73,6 +131,43 @@ export function Settings() {
         </div>
         <button className="btn mt-4 w-full" onClick={refresh}><RefreshCw size={14} />Refresh engine status</button>
         {health && !health.localAsr && <InfoNote tone="warn">No local ASR model found. Word-level captions only burn real detected words — none are invented. Upload your own transcript via a configured provider on a self-hosted instance.</InfoNote>}
+      </Card>
+
+      <Card className="lg:col-span-2">
+        <Eyebrow>API keys</Eyebrow><h3 className="display mb-1 mt-1 text-lg">Bring your own providers</h3>
+        <p className="mb-4 text-[12px] leading-relaxed text-muted">Optional. Keys stay in this browser only, are sent with each request and override the deployment's environment variables. A failed key is flagged automatically here and with a notification. ffmpeg and yt-dlp are bundled tools — they need no key.</p>
+        <div className="grid gap-3 md:grid-cols-2">
+          {KEY_ROWS.map((row) => {
+            const failure = health?.keyFailures?.find((f) => f.provider === row.id);
+            const status = keyStatus[row.id];
+            const ready = configured(row.id);
+            return <div key={row.id} className="rounded-lg border border-line bg-bg p-3">
+              <div className="flex items-center justify-between gap-2">
+                <span className="flex items-center gap-2 text-[12px] font-semibold"><KeyRound size={13} />{PROVIDER_LABELS[row.id]}</span>
+                <span className={`flex items-center gap-1 text-[11px] ${failure || status === 'failed' ? 'text-amber' : status === 'working' ? 'text-acid' : 'text-muted'}`}>
+                  {(failure || status === 'failed') && <CircleAlert size={12} />}{status === 'working' && !failure && <Check size={12} />}
+                  {failure ? 'Not working — replace key' : status === 'failed' ? 'Not working — replace key' : status === 'working' ? 'Working' : ready ? 'Ready' : 'Not configured'}
+                </span>
+              </div>
+              {(failure || status === 'failed') && <div className="mt-1 text-[11px] leading-relaxed text-amber">{failure?.message ?? 'The provider did not respond. Check the key and try again.'}</div>}
+              <div className="mt-3 space-y-2">
+                {row.fields.map((field) => <div key={field.key}>
+                  <label className="label">{field.label}</label>
+                  <input className="field mono" type={field.secret ? 'password' : 'text'} placeholder={field.placeholder}
+                    value={keys[field.key]} onChange={(e) => setKeys((k) => ({ ...k, [field.key]: e.target.value }))} />
+                </div>)}
+              </div>
+              <button className="btn mt-3" disabled={testing !== null || !ready} onClick={() => void testKeys([row.id])}>
+                <Activity size={13} />{testing === row.id ? 'Testing…' : 'Test key'}
+              </button>
+            </div>;
+          })}
+        </div>
+        <div className="mt-3 flex flex-wrap gap-2">
+          <button className="btn btn-primary" onClick={() => { saveApiKeys(keys); toast.success('API keys saved in this browser'); }}><KeyRound size={14} />Save keys</button>
+          <button className="btn" disabled={testing !== null} onClick={() => { saveApiKeys(keys); const ready = KEY_ROWS.map((r) => r.id).filter(configured); if (!ready.length) { toast.info('No keys entered yet'); return; } void testKeys(ready); }}><Activity size={14} />Test all configured keys</button>
+        </div>
+        <div className="mt-3"><InfoNote tone="info">Keys are never written to the server or backups. If a key stops responding, SPLICE falls back to its free local/heuristic engines and tells you to replace it here.</InfoNote></div>
       </Card>
 
       <Card>

@@ -1,8 +1,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { config, modes } from '../config';
-import type { AsrMode, LlmMode, Transcript, Word } from '@shared/types';
+import { effectiveConfig, modes } from '../config';
+import { emptyApiKeys, type ApiKeys, type AsrMode, type LlmMode, type ProviderId, type Transcript, type Word } from '@shared/types';
+import { clearKeyFailure, recordKeyFailure } from './keyStatus';
 import { run, runChecked, uid } from './util';
+
+const llmProvider = (mode: LlmMode): ProviderId => mode === 'groq' ? 'groq' : mode === 'gemini' ? 'gemini' : mode === 'tokenharbor' ? 'tokenharbor' : 'openai-compatible';
+const asrProvider = (mode: AsrMode): ProviderId => mode === 'groq-whisper-large-v3-turbo' ? 'groq' : mode === 'assemblyai' ? 'assemblyai' : 'deepgram';
 
 const postJson = async (url: string, body: unknown, headers: Record<string, string>, timeoutMs = 45_000) => {
   const ctl = new AbortController();
@@ -39,8 +43,9 @@ function parseLlm(text: string): MomentSuggestion[] {
 export async function suggestMoments(input: {
   transcript: Transcript; shots: Array<{ start: number; end: number }>;
   duration: number; count: number; targetSeconds: number; clipType: string; language: string;
-}): Promise<{ source: 'llm' | 'heuristic'; moments: MomentSuggestion[]; mode: LlmMode }> {
-  const mode = modes().llm;
+}, keys: ApiKeys = emptyApiKeys()): Promise<{ source: 'llm' | 'heuristic'; moments: MomentSuggestion[]; mode: LlmMode }> {
+  const c = effectiveConfig(keys);
+  const mode = modes(keys).llm;
   const transcript = input.transcript.words.slice(0, 900).map((w) => `${w.start.toFixed(1)}:${w.w}`).join(' ').slice(0, 20_000);
   const user = JSON.stringify({
     duration: input.duration, count: input.count, targetSeconds: input.targetSeconds,
@@ -51,18 +56,18 @@ export async function suggestMoments(input: {
   try {
     let content = '';
     if (mode === 'tokenharbor' || mode === 'groq' || mode === 'openai-compatible') {
-      const base = mode === 'tokenharbor' ? config.tokenHarbor.base.replace(/\/$/, '')
+      const base = mode === 'tokenharbor' ? c.tokenHarbor.base.replace(/\/$/, '')
         : mode === 'groq' ? 'https://api.groq.com/openai/v1'
-        : config.openaiBase.replace(/\/$/, '');
-      const key = mode === 'tokenharbor' ? config.tokenHarbor.key : mode === 'groq' ? config.groq : config.openaiCompatible;
-      const model = mode === 'tokenharbor' ? config.tokenHarbor.model : mode === 'groq' ? 'llama-3.3-70b-versatile' : (process.env.OPENAI_COMPATIBLE_MODEL ?? 'gpt-4o-mini');
+        : c.openaiBase.replace(/\/$/, '');
+      const key = mode === 'tokenharbor' ? c.tokenHarbor.key : mode === 'groq' ? c.groq : c.openaiCompatible;
+      const model = mode === 'tokenharbor' ? c.tokenHarbor.model : mode === 'groq' ? 'llama-3.3-70b-versatile' : (process.env.OPENAI_COMPATIBLE_MODEL ?? 'gpt-4o-mini');
       const res = await postJson(`${base}/chat/completions`, {
         model, temperature: 0.3, response_format: { type: 'json_object' },
         messages: [{ role: 'system', content: LLM_SYSTEM }, { role: 'user', content: user }],
       }, { authorization: `Bearer ${key}` });
       content = String((res.choices as Array<{ message?: { content?: string } }> | undefined)?.[0]?.message?.content ?? '');
     } else if (mode === 'gemini') {
-      const res = await postJson(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${encodeURIComponent(config.gemini)}`, {
+      const res = await postJson(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${encodeURIComponent(c.gemini)}`, {
         systemInstruction: { parts: [{ text: LLM_SYSTEM }] },
         contents: [{ role: 'user', parts: [{ text: user }] }],
         generationConfig: { temperature: 0.3, responseMimeType: 'application/json' },
@@ -72,15 +77,16 @@ export async function suggestMoments(input: {
       throw new Error('heuristic mode');
     }
     return { source: 'llm', moments: parseLlm(content), mode };
-  } catch {
+  } catch (e) {
+    if (mode !== 'heuristic') recordKeyFailure(llmProvider(mode), e instanceof Error ? e.message : String(e));
     // Heuristic engine is the guaranteed zero-key path. Never fabricate LLM output.
-    return { source: 'heuristic', moments: [], mode: modes().llm === 'heuristic' ? 'heuristic' : mode };
+    return { source: 'heuristic', moments: [], mode: modes(keys).llm === 'heuristic' ? 'heuristic' : mode };
   }
 }
 
 /* ------------------------------------------------------------------ ASR */
 
-export function asrMode(): AsrMode { return modes().asr; }
+export function asrMode(keys: ApiKeys = emptyApiKeys()): AsrMode { return modes(keys).asr; }
 
 async function localWhisper(audio: string, language: string): Promise<Transcript> {
   const bin = process.env.WHISPER_CPP_BIN ?? '/opt/whisper/main';
@@ -102,8 +108,9 @@ async function localWhisper(audio: string, language: string): Promise<Transcript
   return { words, text: words.map((w) => w.w).join(' '), mode: 'local-basic' };
 }
 
-export async function transcribe(audio: string, language: string, signal?: AbortSignal): Promise<Transcript> {
-  const mode = asrMode();
+async function transcribeInner(audio: string, language: string, signal?: AbortSignal, keys: ApiKeys = emptyApiKeys()): Promise<Transcript> {
+  const c = effectiveConfig(keys);
+  const mode = asrMode(keys);
   if (mode === 'groq-whisper-large-v3-turbo') {
     const ctl = new AbortController();
     signal?.addEventListener('abort', () => ctl.abort(), { once: true });
@@ -114,7 +121,7 @@ export async function transcribe(audio: string, language: string, signal?: Abort
     form.append('timestamp_granularities[]', 'word');
     if (language !== 'auto') form.append('language', language);
     const r = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
-      method: 'POST', headers: { authorization: `Bearer ${config.groq}` }, body: form, signal: ctl.signal,
+      method: 'POST', headers: { authorization: `Bearer ${c.groq}` }, body: form, signal: ctl.signal,
     });
     if (!r.ok) throw new Error(`Groq ASR ${r.status}: ${(await r.text()).slice(0, 200)}`);
     const j = await r.json() as { words?: Array<{ word: string; start: number; end: number; confidence?: number }>; text?: string };
@@ -124,7 +131,7 @@ export async function transcribe(audio: string, language: string, signal?: Abort
   if (mode === 'deepgram') {
     const bytes = await import('node:fs/promises').then((m) => m.readFile(audio));
     const r = await fetch(`https://api.deepgram.com/v1/listen?model=nova-3&smart_format=true&punctuate=true&diarize=false&language=${language === 'auto' ? 'multi' : language}`, {
-      method: 'POST', headers: { authorization: `Token ${config.deepgram}`, 'content-type': 'audio/wav' }, body: bytes, signal,
+      method: 'POST', headers: { authorization: `Token ${c.deepgram}`, 'content-type': 'audio/wav' }, body: bytes, signal,
     });
     if (!r.ok) throw new Error(`Deepgram ${r.status}`);
     const j = await r.json() as { results?: { channels?: Array<{ alternatives?: Array<{ transcript?: string; words?: Array<{ word: string; start: number; end: number; confidence: number }> }> }> } };
@@ -135,18 +142,18 @@ export async function transcribe(audio: string, language: string, signal?: Abort
   if (mode === 'assemblyai') {
     const bytes = await import('node:fs/promises').then((m) => m.readFile(audio));
     const up = await fetch('https://api.assemblyai.com/v2/upload', {
-      method: 'POST', headers: { authorization: config.assembly, 'content-type': 'application/octet-stream' }, body: bytes, signal,
+      method: 'POST', headers: { authorization: c.assembly, 'content-type': 'application/octet-stream' }, body: bytes, signal,
     });
     if (!up.ok) throw new Error(`AssemblyAI upload ${up.status}`);
     const { upload_url } = await up.json() as { upload_url: string };
     const req = await fetch('https://api.assemblyai.com/v2/transcript', {
-      method: 'POST', headers: { authorization: config.assembly, 'content-type': 'application/json' },
+      method: 'POST', headers: { authorization: c.assembly, 'content-type': 'application/json' },
       body: JSON.stringify({ audio_url: upload_url, language_code: language === 'auto' ? undefined : language }), signal,
     });
     const { id } = await req.json() as { id: string };
     for (let i = 0; i < 120; i++) {
       await new Promise((r) => setTimeout(r, 2000));
-      const poll = await fetch(`https://api.assemblyai.com/v2/transcript/${id}`, { headers: { authorization: config.assembly }, signal });
+      const poll = await fetch(`https://api.assemblyai.com/v2/transcript/${id}`, { headers: { authorization: c.assembly }, signal });
       const j = await poll.json() as { status: string; text?: string; words?: Array<{ text: string; start: number; end: number; confidence: number }> };
       if (j.status === 'completed') {
         const words = (j.words ?? []).map((w) => ({ w: w.text, start: w.start / 1000, end: w.end / 1000, conf: w.confidence }));
@@ -160,6 +167,16 @@ export async function transcribe(audio: string, language: string, signal?: Abort
   return localWhisper(audio, language);
 }
 
+export async function transcribe(audio: string, language: string, signal?: AbortSignal, keys: ApiKeys = emptyApiKeys()): Promise<Transcript> {
+  const mode = asrMode(keys);
+  try {
+    return await transcribeInner(audio, language, signal, keys);
+  } catch (e) {
+    if (mode !== 'local-basic') recordKeyFailure(asrProvider(mode), e instanceof Error ? e.message : String(e));
+    throw e;
+  }
+}
+
 /** No-key engines may be absent: report honestly instead of inventing words. */
 export function localAsrAvailable(): boolean {
   const bin = process.env.WHISPER_CPP_BIN ?? '/opt/whisper/main';
@@ -171,12 +188,13 @@ export function localAsrAvailable(): boolean {
 
 export interface FingerprintHit { confidence: number; coveredSeconds: number; title?: string }
 
-export async function fingerprint(audio: string, range?: { start: number; end: number }): Promise<FingerprintHit | null> {
-  const mode = modes().rights;
+export async function fingerprint(audio: string, range?: { start: number; end: number }, keys: ApiKeys = emptyApiKeys()): Promise<FingerprintHit | null> {
+  const c = effectiveConfig(keys);
+  const mode = modes(keys).rights;
   try {
     if (mode === 'audd') {
       const form = new FormData();
-      form.append('api_token', config.audd);
+      form.append('api_token', c.audd);
       form.append('file', new Blob([await import('node:fs/promises').then((m) => m.readFile(audio))]), 'audio.wav');
       const r = await fetch('https://api.audd.io/', { method: 'POST', body: form });
       const j = await r.json() as { status?: string; result?: { title?: string; artist?: string }; score?: number };
@@ -190,24 +208,73 @@ export async function fingerprint(audio: string, range?: { start: number; end: n
       const crypto = await import('node:crypto');
       const method = 'POST', uri = '/v1/identify', dataType = 'audio', dataVersion = '1';
       const timestamp = Math.floor(Date.now() / 1000).toString();
-      const stringToSign = `${method}\n${uri}\n${config.acrcloud.key}\n${dataType}\n${dataVersion}\n${timestamp}`;
-      const signature = crypto.createHmac('sha1', config.acrcloud.secret).update(stringToSign).digest('base64');
+      const stringToSign = `${method}\n${uri}\n${c.acrcloud.key}\n${dataType}\n${dataVersion}\n${timestamp}`;
+      const signature = crypto.createHmac('sha1', c.acrcloud.secret).update(stringToSign).digest('base64');
       const form = new FormData();
-      form.append('access_key', config.acrcloud.key);
+      form.append('access_key', c.acrcloud.key);
       form.append('timestamp', timestamp);
       form.append('signature', signature);
       form.append('data_type', dataType);
       form.append('data_version', dataVersion);
       form.append('sample', new Blob([await import('node:fs/promises').then((m) => m.readFile(audio))]), 'sample.wav');
-      const host = config.acrcloud.host || 'identify-us-west-2.acrcloud.com';
+      const host = c.acrcloud.host || 'identify-us-west-2.acrcloud.com';
       const r = await fetch(`https://${host}/v1/identify`, { method: 'POST', body: form });
       const j = await r.json() as { status?: { code?: number }; result?: { music?: Array<{ title?: string; artists?: Array<{ name?: string }>; score?: number }> } };
       const m = j.result?.music?.[0];
       if (m) return { confidence: Number(m.score ?? 0.8), coveredSeconds: range ? range.end - range.start : 30, title: `${m.title ?? 'Unknown'} — ${m.artists?.[0]?.name ?? ''}` };
       return null;
     }
-  } catch { /* fall through: zero-key heuristics still run */ }
+  } catch (e) {
+    if (mode !== 'dsp-heuristics') recordKeyFailure(mode === 'audd' ? 'audd' : 'acrcloud', e instanceof Error ? e.message : String(e));
+    // Fall through: zero-key heuristics still run, but Settings will flag the bad key.
+  }
   return null;
+}
+
+/** Lightweight connectivity check used by the Settings "Test" buttons. */
+export async function testProvider(provider: ProviderId, keys: ApiKeys = emptyApiKeys()): Promise<void> {
+  const c = effectiveConfig(keys);
+  try {
+    if (provider === 'tokenharbor') {
+      if (!c.tokenHarbor.key || !c.tokenHarbor.base) throw new Error('Key and base URL are both required');
+      await postJson(`${c.tokenHarbor.base.replace(/\/$/, '')}/chat/completions`, {
+        model: c.tokenHarbor.model || 'gpt-4o-mini', max_tokens: 4,
+        messages: [{ role: 'user', content: 'Reply with OK' }],
+      }, { authorization: `Bearer ${c.tokenHarbor.key}` }, 12_000);
+    } else if (provider === 'groq') {
+      const r = await fetch('https://api.groq.com/openai/v1/models', { headers: { authorization: `Bearer ${c.groq}` }, signal: AbortSignal.timeout(12_000) });
+      if (!r.ok) throw new Error(`Groq returned ${r.status}`);
+    } else if (provider === 'gemini') {
+      const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(c.gemini)}`, { signal: AbortSignal.timeout(12_000) });
+      if (!r.ok) throw new Error(`Gemini returned ${r.status}`);
+    } else if (provider === 'openai-compatible') {
+      if (!c.openaiBase) throw new Error('Base URL is required');
+      const r = await fetch(`${c.openaiBase.replace(/\/$/, '')}/models`, { headers: { authorization: `Bearer ${c.openaiCompatible}` }, signal: AbortSignal.timeout(12_000) });
+      if (!r.ok) throw new Error(`Endpoint returned ${r.status}`);
+    } else if (provider === 'deepgram') {
+      const r = await fetch('https://api.deepgram.com/v1/projects', { headers: { authorization: `Token ${c.deepgram}` }, signal: AbortSignal.timeout(12_000) });
+      if (!r.ok) throw new Error(`Deepgram returned ${r.status}`);
+    } else if (provider === 'assemblyai') {
+      const r = await fetch('https://api.assemblyai.com/v2/transcript?limit=1', { headers: { authorization: c.assembly }, signal: AbortSignal.timeout(12_000) });
+      if (!r.ok) throw new Error(`AssemblyAI returned ${r.status}`);
+    } else if (provider === 'audd') {
+      const form = new FormData();
+      form.append('api_token', c.audd);
+      const r = await fetch('https://api.audd.io/', { method: 'POST', body: form, signal: AbortSignal.timeout(12_000) });
+      const j = await r.json() as { status?: string; error?: { error_msg?: string } };
+      if (j.status === 'error' && /token|api/i.test(j.error?.error_msg ?? '')) throw new Error(j.error?.error_msg ?? 'AudD rejected the key');
+    } else {
+      // ACRCloud signs every request with the actual audio sample; a live probe is
+      // not possible without one. Presence is validated, real failures are flagged
+      // by fingerprint() during a job.
+      if (!c.acrcloud.key || !c.acrcloud.secret) throw new Error('Access key and secret are both required');
+    }
+    clearKeyFailure(provider);
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    recordKeyFailure(provider, message);
+    throw e;
+  }
 }
 
 export function disposeProcess(kill: () => void) { try { kill(); } catch { /* ignore */ } }

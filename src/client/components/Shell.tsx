@@ -8,6 +8,7 @@ import {
 import { Toaster, toast } from 'sonner';
 import { useApp, type Page } from '../store/useApp';
 import { api } from '../lib/api';
+import { checkKeyFailures } from '../lib/keyAlerts';
 import { sound } from '../lib/sound';
 import { bytesUsed } from '../lib/db';
 import { Drawer, Modal } from './ui';
@@ -216,6 +217,12 @@ export function Shell({ children, onBoot }: { children: React.ReactNode; onBoot:
   const [boot, setBoot] = useState(true);
   const section = useApp((s) => s.page);
   useEffect(() => { document.body.dataset.section = ['configure'].includes(section) ? 'configure' : ['results', 'editor'].includes(section) ? 'results' : 'home'; }, [section]);
+  useEffect(() => {
+    if (boot) return;
+    void checkKeyFailures();
+    const timer = setInterval(() => { void checkKeyFailures(); }, 30_000);
+    return () => clearInterval(timer);
+  }, [boot]);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); openDrawer('palette'); }

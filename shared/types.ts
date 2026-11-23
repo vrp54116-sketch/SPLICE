@@ -260,11 +260,43 @@ export interface JobEvent {
   payload?: unknown;
 }
 
+export type ProviderId = 'tokenharbor' | 'groq' | 'gemini' | 'openai-compatible' | 'deepgram' | 'assemblyai' | 'audd' | 'acrcloud';
+
+/** Keys entered in Settings. Stored in the browser only and sent per request. */
+export interface ApiKeys {
+  tokenHarborKey: string;
+  tokenHarborBase: string;
+  tokenHarborModel: string;
+  groq: string;
+  gemini: string;
+  openaiCompatible: string;
+  openaiBase: string;
+  deepgram: string;
+  assembly: string;
+  audd: string;
+  acrcloudKey: string;
+  acrcloudSecret: string;
+  acrcloudHost: string;
+}
+
+export const emptyApiKeys = (): ApiKeys => ({
+  tokenHarborKey: '', tokenHarborBase: '', tokenHarborModel: '',
+  groq: '', gemini: '', openaiCompatible: '', openaiBase: '',
+  deepgram: '', assembly: '', audd: '', acrcloudKey: '', acrcloudSecret: '', acrcloudHost: '',
+});
+
+export interface KeyFailure { provider: ProviderId; message: string; at: number }
+
+export const PROVIDER_LABELS: Record<ProviderId, string> = {
+  tokenharbor: 'TokenHarbor', groq: 'Groq', gemini: 'Gemini', 'openai-compatible': 'OpenAI-compatible',
+  deepgram: 'Deepgram', assemblyai: 'AssemblyAI', audd: 'AudD', acrcloud: 'ACRCloud',
+};
+
 export type ErrorCode =
   | 'INVALID_URL' | 'NOT_FOUND' | 'PRIVATE' | 'LIVE_UNSUPPORTED'
   | 'AGE_RESTRICTED' | 'GEO_BLOCKED' | 'BOT_BLOCKED' | 'TOO_LARGE'
   | 'SERVER_BUSY' | 'ENGINE_UNAVAILABLE' | 'RIGHTS_BLOCKED' | 'EXTRACT_FAILED'
-  | 'VALIDATION' | 'RATE_LIMIT';
+  | 'VALIDATION' | 'RATE_LIMIT' | 'KEY_INVALID';
 export interface TypedError {
   code: ErrorCode;
   message: string;

@@ -1,4 +1,5 @@
 import type { TypedError } from '@shared/types';
+import { encodeApiKeys, loadApiKeys } from './keys';
 
 export class ApiError extends Error {
   error: TypedError;
@@ -10,6 +11,8 @@ export async function api<T>(path: string, body?: unknown, init: RequestInit = {
   if (body !== undefined) headers['content-type'] = 'application/json';
   const token = localStorage.getItem('splice_api_token');
   if (token) headers.authorization = `Bearer ${token}`;
+  const keys = encodeApiKeys(loadApiKeys());
+  if (keys) headers['x-splice-keys'] = keys;
   const res = await fetch(path, {
     ...init, headers,
     ...(body !== undefined ? { method: init.method ?? 'POST', body: JSON.stringify(body) } : {}),

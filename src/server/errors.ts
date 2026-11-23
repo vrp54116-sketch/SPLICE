@@ -15,6 +15,7 @@ export const REMEDIES: Record<ErrorCode, string> = {
   EXTRACT_FAILED: 'Metadata could not be extracted. Verify the URL and try again; if it persists, upload the file directly.',
   VALIDATION: 'Check the highlighted field and its helper text, then try again.',
   RATE_LIMIT: 'Too many probes in one minute. Wait a moment and retry.',
+  KEY_INVALID: 'This API key is not working (invalid, expired or unreachable). Open Settings → API keys to replace it.',
 };
 
 export class AppError extends Error {

@@ -15,6 +15,9 @@ import { repairPlans, scan, type RightsInput } from './pipeline/rights';
 import { analyzeFrames, pcmToFloat } from './pipeline/dsp';
 import { extractAudio } from './pipeline/render';
 import { BACKGROUNDS, MUSIC, type OffloadResult, type ProjectConfig, type ShieldReport } from '@shared/types';
+import { keysFromHeader } from './lib/keys';
+import { listKeyFailures } from './lib/keyStatus';
+import { testProvider } from './lib/providers';
 import { uid, safeName } from './lib/util';
 
 const S = {
@@ -35,6 +38,7 @@ const S = {
   rightsRepair: z.object({ clipId: z.string().min(1), actions: z.array(z.enum(['mute_music', 'replace_music', 'trim_span', 'blur_roi', 'crop_overlay', 'add_attribution', 'add_voiceover', 'regenerate_meta'])).min(1), confirmation: z.boolean().optional() }),
   recut: z.object({ clipId: z.string().min(1), start: z.number().nonnegative(), end: z.number().positive(), note: z.string().optional() }),
   publish: z.object({ clipIds: z.array(z.string().min(1)).min(1), platform: z.string().optional() }),
+  keyTest: z.object({ provider: z.enum(['tokenharbor', 'groq', 'gemini', 'openai-compatible', 'deepgram', 'assemblyai', 'audd', 'acrcloud']) }),
 };
 
 const evidence = new Map<string, OffloadResult>();
@@ -42,6 +46,8 @@ const reports = new Map<string, ShieldReport>();
 const confirmations = new Map<string, boolean>();
 
 function json<T>(reply: FastifyReply, code: number, body: T) { return reply.code(code).send(body); }
+
+const keysFor = (req: FastifyRequest) => keysFromHeader(req.headers['x-splice-keys']);
 
 function guard(req: FastifyRequest) {
   if (!config.apiToken) return;
@@ -61,19 +67,30 @@ export async function registerRoutes(app: FastifyInstance) {
   });
 
   const probeHits = new Map<string, number[]>();
-  app.get('/api/health', async () => ({
+  app.get('/api/health', async (req) => ({
     status: 'ok',
     ytdlpVersion: await ytdlpVersion(),
     ffmpeg: (await import('./pipeline/render')).FFMPEG,
     busy: queue.pending > 0 || queue.size > 0,
     queueSize: queue.size,
-    ...modes(),
+    ...modes(keysFor(req)),
+    keyFailures: listKeyFailures(),
     localAsr: (await import('./lib/providers')).localAsrAvailable(),
     uptime: Math.round((Date.now() - config.startedAt) / 1000),
     storageLimitGb: config.maxUploadGb,
     maxDurationMin: 120,
   }));
-  app.get('/api/modes', async () => ({ ...publicEnv(), ...modes() }));
+  app.get('/api/modes', async (req) => ({ ...publicEnv(keysFor(req)), ...modes(keysFor(req)) }));
+
+  app.post('/api/keys/test', async (req) => {
+    const b = S.keyTest.parse(req.body);
+    try {
+      await testProvider(b.provider, keysFor(req));
+      return { ok: true, provider: b.provider, message: 'Working' };
+    } catch (e) {
+      fail('KEY_INVALID', `${b.provider} key is not working: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  });
 
   /* ------------------------------------------------------------- upload */
   app.post('/api/upload/init', async (req, reply) => {
@@ -126,6 +143,7 @@ export async function registerRoutes(app: FastifyInstance) {
     if (!cfg?.source) fail('VALIDATION', 'A source is required. Upload a file or paste a video URL.');
     if (!cfg.attestation) fail('RIGHTS_BLOCKED', 'Choose a source attestation before starting.');
     const job = createJob(b.projectId);
+    const keys = keysFor(req);
     void queue.add(async () => {
       try {
         step(job.id, 'ingest', 1, 'Fetching source');
@@ -142,7 +160,7 @@ export async function registerRoutes(app: FastifyInstance) {
         const info = await probe(mediaPath);
         const saved = evidence.get(cfg.source.ref);
         if (saved) cfg.source.offload = saved;
-        const clips = await runPipeline(job, cfg, mediaPath, info, meta);
+        const clips = await runPipeline(job, cfg, mediaPath, info, meta, keys);
         void clips;
       } catch (e) {
         if (!job.controller.signal.aborted) errorJob(job.id, typedError(e));
@@ -185,11 +203,12 @@ export async function registerRoutes(app: FastifyInstance) {
     if (!cfg) fail('NOT_FOUND', 'This clip has no configuration snapshot to recut.');
     cfg.timeframe = { start: Math.max(0, b.start - 1), end: b.end + 1 };
     const job = createJob(old.state.projectId);
+    const keys = keysFor(req);
     void queue.add(async () => {
       try {
         const mediaPath = cfg.source.kind === 'youtube' ? (await downloadVideo(cfg.source.url ?? cfg.source.ref)).path : await fileForRef(cfg.source.ref);
         const info = await probe(mediaPath);
-        await runPipeline(job, cfg, mediaPath, info, { title: cfg.source.title });
+        await runPipeline(job, cfg, mediaPath, info, { title: cfg.source.title }, keys);
       } catch (e) { if (!job.controller.signal.aborted) errorJob(job.id, typedError(e)); }
     });
     return json(reply, 202, { jobId: job.id, note: b.note ?? 'Recut from the editor' });
