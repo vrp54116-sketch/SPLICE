@@ -29,7 +29,7 @@ COPY package.json package-lock.json ./
 COPY public ./public
 RUN npm ci && npm cache clean --force
 
-COPY tsconfig.json tsconfig.server.json vite.config.ts build-server.mjs index.html ./
+COPY tsconfig.json tsconfig.server.json vite.config.ts index.html ./
 COPY shared ./shared
 COPY src ./src
 COPY scripts ./scripts
