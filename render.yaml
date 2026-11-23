@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: splice
+    runtime: docker
+    plan: free
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3001
+      - key: SPLICE_SCRATCH
+        value: /tmp/splice
+      - key: FILE_TTL_MIN
+        value: 45
+      - key: MAX_UPLOAD_GB
+        value: 2
+      - key: MAX_CONCURRENT
+        value: 1
+    # Optional. Every one of these is a capability upgrade, never a requirement.
+    # - key: GROQ_API_KEY
+    # - key: DEEPGRAM_API_KEY
+    # - key: ASSEMBLYAI_API_KEY
+    # - key: TOKENHARBOR_API_KEY
+    # - key: AUDD_API_KEY
+    # - key: YT_COOKIES_B64
+    # - key: YT_PROXY
+    # - key: SPLICE_API_TOKEN
