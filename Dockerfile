@@ -24,15 +24,15 @@ RUN curl -fsSL -o /usr/local/bin/yt-dlp \
 
 WORKDIR /app
 
-# public/ must exist before postinstall: it synthesizes the 6 music loops there.
+# public/ and scripts/ must exist before postinstall: it synthesizes the 6 music loops there.
 COPY package.json package-lock.json ./
 COPY public ./public
+COPY scripts ./scripts
 RUN npm ci && npm cache clean --force
 
 COPY tsconfig.json tsconfig.server.json vite.config.ts index.html ./
 COPY shared ./shared
 COPY src ./src
-COPY scripts ./scripts
 
 # Type-check both projects, build the server bundle and the SPA, then drop
 # build-only dependencies so the final image stays small.
